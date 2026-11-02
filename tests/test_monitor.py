@@ -4,18 +4,21 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
+from duty import easter, geneva_holidays, on_duty
 from monitor import Config, db_open, quake_api_url, handle_weather, mark_source, mode_of, poll_earthquakes, poll_weather, record_notice, signal_command
 from risk_rules import Risk, find_earthquake_risks, find_weather_risks, km_distance
 
 FIXED = datetime(2026, 11, 2, 11, 20, tzinfo=timezone.utc)
 
 
-def config(path):
-    with patch.dict(os.environ, {'DB_PATH': str(path), 'DRY_RUN': '1'}):
+def config(path, duty='0'):
+    # Rule tests run at FIXED (Monday midday, off duty), so duty filtering is opt-in here.
+    with patch.dict(os.environ, {'DB_PATH': str(path), 'DRY_RUN': '1', 'DUTY_HOURS_ONLY': duty}):
         return Config.from_env()
 
 
@@ -157,6 +160,45 @@ class RiskRulesTests(unittest.TestCase):
         poll_weather(db, self.cfg, fetch=lambda url: good_weather(), now=FIXED)
         self.assertEqual(db.execute('SELECT count(*) FROM forecast_snapshots').fetchone()[0], 1)
         db.close()
+
+    def test_geneva_holidays(self):
+        self.assertEqual(easter(2026), date(2026, 4, 5))
+        days = geneva_holidays(2026)
+        for d in (date(2026, 4, 3), date(2026, 4, 6), date(2026, 5, 14), date(2026, 5, 25),
+                  date(2026, 9, 10), date(2026, 12, 31)):
+            self.assertIn(d, days)
+
+    def test_duty_schedule(self):
+        cfg = config(Path(self.t.name) / 'test.db', duty='1')
+        local = lambda *a: datetime(*a, tzinfo=ZoneInfo('Europe/Zurich'))
+        self.assertFalse(on_duty(local(2026, 11, 2, 12, 20), cfg))   # Monday midday
+        self.assertTrue(on_duty(local(2026, 11, 2, 5, 59), cfg))     # Monday before 06:00
+        self.assertFalse(on_duty(local(2026, 11, 6, 18, 59), cfg))   # Friday before 19:00
+        self.assertTrue(on_duty(local(2026, 11, 6, 19, 0), cfg))     # Friday evening
+        self.assertTrue(on_duty(local(2026, 11, 7, 12, 0), cfg))     # Saturday midday
+        self.assertTrue(on_duty(local(2026, 12, 31, 12, 0), cfg))    # Restauration (Thursday)
+
+    def test_weather_outside_duty_ignored_but_evening_reported(self):
+        cfg = config(Path(self.t.name) / 'test.db', duty='1')
+        self.assertEqual(find_weather_risks(good_weather(), cfg, FIXED), [])  # 13:00-17:00 local
+        evening = FIXED.replace(hour=16)                     # 17:20 local
+        first = evening.replace(minute=0)
+        payload = {'hourly': {
+            'time': [(first + timedelta(hours=i)).strftime('%Y-%m-%dT%H:%M') for i in range(6)],
+            'precipitation': [0, 10, 10, 10, 0, 0],          # 17-20 local, ends in duty
+            'wind_gusts_10m': [10, 90, 10, 80, 10, 10],      # 90 at 17-18 local, 80 at 19-20
+            'temperature_2m': [10] * 6}}
+        r = {i.code: i for i in find_weather_risks(payload, cfg, evening)}
+        self.assertEqual(set(r), {'rain', 'wind'})
+        self.assertIn('80 km/h', r['wind'].detail)           # only the on-duty gust counts
+
+    def test_quake_outside_duty_ignored(self):
+        cfg = config(Path(self.t.name) / 'test.db', duty='1')
+        quake = lambda t: {'features': [{'id': 'q', 'properties': {'mag': 4.0, 'time': int(t.timestamp()*1000)},
+                                         'geometry': {'coordinates': [cfg.lon, cfg.lat, 5]}}]}
+        self.assertEqual(find_earthquake_risks(quake(FIXED), cfg, FIXED), [])
+        saturday = FIXED + timedelta(days=5)
+        self.assertEqual(len(find_earthquake_risks(quake(saturday), cfg, saturday)), 1)
 
     def test_signal_command_targets_exactly_one_recipient(self):
         cfg = config(Path(self.t.name) / 'test.db')

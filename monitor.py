@@ -11,13 +11,14 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from duty import on_duty
 from risk_rules import Risk, find_earthquake_risks, find_weather_risks
 
 BASE = Path(__file__).resolve().parent
@@ -65,6 +66,9 @@ class Config:
     weather_clear_minutes: int
     stale_source_minutes: int
     snapshot_retention_days: int
+    duty_hours_only: bool
+    duty_start_hour: int
+    duty_end_hour: int
     db_path: Path
     priorities: dict
 
@@ -96,6 +100,9 @@ class Config:
             weather_clear_minutes=int(os.environ.get('WEATHER_CLEAR_MINUTES', '60')),
             stale_source_minutes=int(os.environ.get('STALE_SOURCE_MINUTES', '60')),
             snapshot_retention_days=int(os.environ.get('SNAPSHOT_RETENTION_DAYS', '90')),
+            duty_hours_only=os.environ.get('DUTY_HOURS_ONLY', '1').strip() != '0',
+            duty_start_hour=int(os.environ.get('DUTY_START_HOUR', '19')),
+            duty_end_hour=int(os.environ.get('DUTY_END_HOUR', '6')),
             db_path=Path(os.environ.get('DB_PATH', str(BASE / 'monitor.sqlite3'))),
             priorities=json.loads((BASE / 'priorities.json').read_text(encoding='utf-8')),
         )
@@ -111,6 +118,9 @@ class Config:
             raise ValueError('STALE_SOURCE_MINUTES must be at least 15')
         if cfg.snapshot_retention_days < 0:
             raise ValueError('SNAPSHOT_RETENTION_DAYS must be 0 (keep forever) or more')
+        if not (0 <= cfg.duty_start_hour <= 23 and 0 <= cfg.duty_end_hour <= 23
+                and cfg.duty_start_hour != cfg.duty_end_hour):
+            raise ValueError('DUTY_START_HOUR/DUTY_END_HOUR must be different hours 0-23')
         if not (cfg.rain_3h_mm < cfg.rain_3h_high_mm and cfg.gust_kmh < cfg.gust_high_kmh
                 and cfg.heat_c < cfg.heat_high_c and cfg.cold_high_c < cfg.cold_c
                 and cfg.quake_mag < cfg.quake_high_mag):
@@ -390,6 +400,11 @@ def poll_earthquakes(db, cfg, fetch=get_json, now=None):
 
 def print_status(db, cfg):
     print(f'Area: {cfg.area} | Mode: {mode_of(cfg)} | Database: {cfg.db_path}')
+    if cfg.duty_hours_only:
+        print(f'Volunteers on duty now: {"yes" if on_duty(utcnow(), cfg) else "no"} '
+              f'(weekdays {cfg.duty_start_hour}:00-{cfg.duty_end_hour}:00, weekends and GE holidays all day)')
+    else:
+        print('Duty-hours filter: off (all hazards reported)')
     print('Data sources:')
     rows = db.execute('SELECT source,checked_utc,last_ok_utc,ok,last_error FROM source_status').fetchall()
     for src, checked, good, ok, error in rows:
@@ -437,8 +452,10 @@ def main():
                       'precipitation':[0, 9, 11, 9, 0, 0],
                       'wind_gusts_10m':[15, 84, 22, 11, 8, 8],
                       'temperature_2m':[21, 22, 23, 22, 20, 19]}
-            risks = find_weather_risks({'hourly':hourly}, cfg, now)
-            handle_weather(db, cfg, risks, now)
+            # The demo ignores duty hours so it shows the same example at any time of day.
+            demo_cfg = replace(cfg, duty_hours_only=False)
+            risks = find_weather_risks({'hourly':hourly}, demo_cfg, now)
+            handle_weather(db, demo_cfg, risks, now)
             print(f'Offline demo complete: {len(risks)} example advisories, NO messages sent.')
         elif args.once:
             poll_weather(db, cfg)

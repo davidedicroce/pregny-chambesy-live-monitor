@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 from typing import Any
 
+from duty import on_duty
+
 
 @dataclass(frozen=True)
 class Risk:
@@ -62,24 +64,36 @@ def find_weather_risks(payload: dict[str, Any], cfg: Any, now: datetime) -> list
     if not precipitation or not gusts or not temps:
         raise ValueError('Weather feed lacks numeric values; retaining previous alert state')
 
+    # Only hazards during volunteer duty hours matter. Precipitation/gust slots cover the
+    # hour *before* their stamp, so they are judged by that hour's midpoint.
+    def slot_on_duty(t):
+        return on_duty(t - timedelta(minutes=30), cfg)
+    window = precipitation[:3]
+    gusts = [(v, t) for v, t in gusts if slot_on_duty(t)]
+    temps = [(v, t) for v, t in temps if on_duty(t, cfg)]
+
     url = 'https://open-meteo.com/en/docs'
     risks = []
     # 3h accumulation: the first 3 future hourly slots (covering roughly the next 3 hours).
-    rain_3h = sum(v for v, _ in precipitation[:3])
-    if rain_3h >= cfg.rain_3h_mm:
+    # Rain just before duty still matters (flooding lags rain), so the whole 3h total
+    # counts as long as part of that window falls in duty hours.
+    rain_3h = sum(v for v, _ in window)
+    if rain_3h >= cfg.rain_3h_mm and any(slot_on_duty(t) for _, t in window):
         level = 2 if rain_3h >= cfg.rain_3h_high_mm else 1
         risks.append(Risk('rain', level, 'weather:rain', 'Heavy rainfall forecast',
             f'~{rain_3h:.1f} mm precipitation forecast across 3 hourly slots in the next ~3 hours. '
             'This is not a flood forecast; drainage, lake levels and observed rain are not included.',
             'Open-Meteo (forecast)', url))
 
-    peak_gust, gust_time = max(gusts, key=lambda v: v[0])
+    peak_gust, gust_time = max(gusts, key=lambda v: v[0]) if gusts else (0.0, None)
     if peak_gust >= cfg.gust_kmh:
         level = 2 if peak_gust >= cfg.gust_high_kmh else 1
         risks.append(Risk('wind', level, 'weather:wind', 'Strong wind forecast',
             f'Peak grid-cell gust forecast {peak_gust:.0f} km/h near {gust_time:%Y-%m-%d %H:%M} UTC. '
             'Actual localized gusts may differ.', 'Open-Meteo (forecast)', url))
 
+    if not temps:
+        return risks
     high_temp, high_time = max(temps, key=lambda v: v[0])
     if high_temp >= cfg.heat_c:
         level = 2 if high_temp >= cfg.heat_high_c else 1
@@ -119,6 +133,8 @@ def find_earthquake_risks(payload: dict[str, Any], cfg: Any, now: datetime) -> l
             continue
         if magnitude < cfg.quake_mag or dist > cfg.quake_km:
             continue
+        if not on_duty(datetime.fromtimestamp(float(ms) / 1000, timezone.utc), cfg):
+            continue  # happened outside volunteer duty hours
         # Magnitude and distance do not imply actual local shaking/intensity.
         level = 2 if magnitude >= cfg.quake_high_mag else 1
         event_id = event.get('id') or str(ms)
