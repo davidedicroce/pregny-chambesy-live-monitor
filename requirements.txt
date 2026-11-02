@@ -1,0 +1,2 @@
+# Python 3.10+ standard library only; no pip dependencies.
+# signal-cli is an external program needed only to actually send Signal messages.

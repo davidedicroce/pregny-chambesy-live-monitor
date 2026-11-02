@@ -1,0 +1,18 @@
+[Unit]
+Description=Experimental Pregny-Chambesy weather and earthquake advisories (not dispatch)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# EDIT BOTH user and project location before installing.
+User=REPLACE_USER
+WorkingDirectory=/home/REPLACE_USER/pregny-chambesy-live-monitor
+ExecStart=/home/REPLACE_USER/pregny-chambesy-live-monitor/run.sh
+Restart=on-failure
+RestartSec=20
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
